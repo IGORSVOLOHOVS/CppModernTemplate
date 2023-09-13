@@ -355,6 +355,43 @@ int main() {
     return 0;
 }
 ```
+## Qt graph
 
+```cpp
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QtWidgets>
+#include <QtCharts/QChartView>
+#include <QtCharts/QLineSeries>
+
+int main(int argc, char *argv[])
+{
+    QApplication a(argc, argv);
+
+    // Создаем объекты для графика и данных
+    QtCharts::QChartView chartView;
+    QtCharts::QChart *chart = chartView.chart();
+    QtCharts::QLineSeries *series = new QtCharts::QLineSeries();
+
+    // Добавляем точки данных в серию
+    for (double x = -10.0; x <= 10.0; x += 0.1) {
+        double y = sin(x); // Ваша математическая функция
+        series->append(x, y);
+    }
+
+    // Добавляем серию на график
+    chart->addSeries(series);
+
+    // Устанавливаем оси
+    chart->createDefaultAxes();
+
+    // Создаем окно приложения и выводим график
+    QMainWindow window;
+    window.setCentralWidget(&chartView);
+    window.resize(800, 600);
+    window.show();
+
+    return a.exec();
+}
+```
 ---
 
