@@ -1,0 +1,446 @@
+name: release-gate
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [release]
+
+concurrency:
+  group: release-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  checks:
+    name: checks
+    runs-on: windows
+    timeout-minutes: 60
+    concurrency:
+      group: installer-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      HEAD_REF:    ${{ github.head_ref }}
+      GITEA_TOKEN: ${{ secrets.LAB_BOT_TOKEN }}
+    steps:
+      - name: Only test may enter release
+        run: |
+          if ($env:HEAD_REF -cne 'test') {
+            Write-Host '::error::release accepts changes only from test'; exit 1
+          }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          lfs: true
+      - name: App or library
+        id: kind
+        run: |
+          if (-not (Test-Path recipe.ps1)) {
+            Write-Host '::error::recipe.ps1 is missing - section 7 requires it at the repository root'
+            exit 1
+          }
+          $m = Select-String -Path recipe.ps1 -Pattern '^\s*\$App\s*=\s*[''"]([^''"]+)[''"]'
+          $p = Select-String -Path recipe.ps1 -Pattern '^\s*\$Provides\s*=\s*@\(\s*[''"][^''"]+[''"]'
+          $app   = if ($m) { 'true' } else { 'false' }
+          $ships = if ($m -or $p) { 'true' } else { 'false' }
+          Write-Host "app=$app ships=$ships"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "app=$app`nships=$ships`n", (New-Object System.Text.UTF8Encoding $false))
+      - name: Tests and formatting
+        run: |
+          .\recipe.ps1 test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code
+
+      - name: Build installer
+        run: |
+          .\recipe.ps1 build
+          exit $LASTEXITCODE
+
+      - name: Prove the installer installs, and uninstalls
+        if: steps.kind.outputs.app == 'true'
+        run: |
+          if (-not (Get-ChildItem dist -Filter *.exe -ErrorAction SilentlyContinue)) {
+            Write-Host '::error::recipe.ps1 build produced no installer exe in dist\'; exit 1
+          }
+          .\recipe.ps1 install
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::silent install failed'; exit 1 }
+          .\recipe.ps1 info
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::product not present after install'; exit 1 }
+          .\recipe.ps1 uninstall
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::silent uninstall failed'; exit 1 }
+          .\recipe.ps1 info
+          if ($LASTEXITCODE -eq 0) { Write-Host '::error::product still present after uninstall'; exit 1 }
+          exit 0
+
+      - name: Leave the runner clean
+        if: always()
+        env:
+          IS_APP: ${{ steps.kind.outputs.app }}
+        run: |
+          if ($env:IS_APP -eq 'true') {
+            try { .\recipe.ps1 uninstall } catch { Write-Host "cleanup: uninstall skipped: $_" }
+          }
+          try { .\recipe.ps1 clean } catch { Write-Host "cleanup: clean skipped: $_" }
+          exit 0
+
+  manual-gate:
+    name: manual-gate
+    needs: checks
+    runs-on: windows
+    timeout-minutes: 170
+    env:
+      GITEA_URL:    ${{ github.server_url }}
+      GITEA_API:    ${{ github.server_url }}/api/v1
+      OWNER:        igors-lab
+      REPO:         ${{ github.repository }}
+      NAME:         ${{ github.event.repository.name }}
+      PR:           ${{ github.event.pull_request.number }}
+      SHA:          ${{ github.event.pull_request.head.sha }}
+      TOKEN:        ${{ secrets.LAB_BOT_TOKEN }}
+      WAIT_MINUTES: '150'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Read the manual test list
+        id: list
+        run: |
+          $ids = @(); $optional = @()
+          if (Test-Path tests/manual/tests.json) {
+            try {
+              $doc = [System.IO.File]::ReadAllText((Join-Path $PWD 'tests/manual/tests.json')) | ConvertFrom-Json
+            } catch {
+              Write-Host "::error::tests/manual/tests.json does not parse: $($_.Exception.Message)"
+              exit 1
+            }
+            if (-not $doc -or -not $doc.PSObject.Properties['tests'] -or $doc.tests -isnot [array]) {
+              Write-Host '::error::tests/manual/tests.json has no "tests" list - nothing to test by hand is written "tests": []'
+              exit 1
+            }
+            foreach ($t in $doc.tests) {
+              $id = "$($t.id)"
+              if ($id -cnotmatch '^[a-z0-9][a-z0-9_-]{0,60}$' -or $id -ceq 'verdict') {
+                Write-Host "::error::tests/manual/tests.json: '$id' is not a legal manual test id"
+                exit 1
+              }
+              if ($ids -contains $id) {
+                Write-Host "::error::tests/manual/tests.json: the id '$id' appears twice"
+                exit 1
+              }
+              $ids += $id
+              if ($t.blocking -is [bool] -and -not $t.blocking) { $optional += $id }
+            }
+          }
+          $out = "count=$($ids.Count)`nids=$($ids -join ',')`noptional=$($optional -join ',')`n"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, $out, (New-Object System.Text.UTF8Encoding $false))
+
+      - name: An empty list is a passed list
+        if: steps.list.outputs.count == '0'
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/statuses/$env:SHA" `
+            -Headers $h -ContentType 'application/json' -Body (@{
+              context = 'manual/verdict'; state = 'success'
+              description = 'no manual tests defined'
+              target_url  = "$env:GITEA_URL/$env:REPO/pulls/$env:PR" } | ConvertTo-Json)
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'manual-report.md'),
+              "No manual tests defined for this project.`n", (New-Object System.Text.UTF8Encoding $false))
+
+      - name: Seed statuses, keep earlier results and a green verdict
+        id: seed
+        if: steps.list.outputs.count != '0'
+        env:
+          IDS:      ${{ steps.list.outputs.ids }}
+          OPTIONAL: ${{ steps.list.outputs.optional }}
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          function Get-States {
+            $all = @{}
+            for ($page = 1; $page -le 40; $page++) {
+              $seen = $all.Count
+              $r = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/commits/$env:SHA/status?limit=50&page=$page"
+              foreach ($s in @($r.statuses | Where-Object { $_ })) { $all[$s.context] = $s }
+              if ($all.Count -eq $seen) { break }
+            }
+            $all
+          }
+          function Get-State($s) {
+            if (-not $s) { 'missing' } elseif ($s.PSObject.Properties['status']) { $s.status } else { $s.state }
+          }
+          function Test-Green($id, $s) {
+            $st = Get-State $s
+            ($st -eq 'success') -or ($st -eq 'warning' -and $optional -contains $id -and "$($s.description)" -cmatch '^n/a: \S')
+          }
+          $ids = @($env:IDS -split ',')
+          $optional = @($env:OPTIONAL -split ',' | Where-Object { $_ })
+          $target = "$env:GITEA_URL/$env:REPO/pulls/$env:PR"
+          $states = Get-States
+          $green = 0
+          foreach ($id in $ids) {
+            if (-not $states["manual/$id"]) {
+              Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/statuses/$env:SHA" `
+                -Headers $h -ContentType 'application/json' -Body (@{
+                  context = "manual/$id"; state = 'pending'; description = 'none'
+                  target_url = $target } | ConvertTo-Json)
+            } elseif (Test-Green $id $states["manual/$id"]) {
+              $green++
+            }
+          }
+          if ($green -eq $ids.Count -and (Get-State $states['manual/verdict']) -eq 'success') {
+            $state = 'success'
+            $desc  = "kept: $green/$($ids.Count) green on $($env:SHA.Substring(0, 7))"
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "kept=true`n", (New-Object System.Text.UTF8Encoding $false))
+          } else {
+            $state = 'pending'
+            $desc  = 'waiting for the manual test verdict'
+          }
+          Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/statuses/$env:SHA" `
+            -Headers $h -ContentType 'application/json' -Body (@{
+              context = 'manual/verdict'; state = $state; description = $desc
+              target_url = $target } | ConvertTo-Json)
+
+      - name: Tell the tester what to do
+        if: steps.list.outputs.count != '0' && steps.seed.outputs.kept != 'true' && github.event.action != 'synchronized' && github.event.action != 'synchronize'
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          $body = "Manual testing required for ``$env:SHA``.`n" +
+                  "1. ``git checkout test`` and ``git pull```n" +
+                  "2. ``python tests/manual/serve.py```n" +
+                  "3. Open <http://127.0.0.1:8765/>, run the tests, press **Done**.`n" +
+                  "Or set the round aside: a comment with the override phrase and a ``Why:`` line (section 8).`n" +
+                  "Merge only once ``manual/verdict`` is green."
+          try {
+            Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$env:PR/comments" `
+              -Headers $h -ContentType 'application/json' -Body (@{ body = $body } | ConvertTo-Json)
+          } catch {
+            Write-Host "::warning::the tester's instructions were not posted: $_"
+          }
+
+      - name: Wait for the verdict, or the owner's override
+        id: wait
+        if: steps.list.outputs.count != '0'
+        env:
+          IDS:      ${{ steps.list.outputs.ids }}
+          OPTIONAL: ${{ steps.list.outputs.optional }}
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          function Get-States {
+            $all = @{}
+            for ($page = 1; $page -le 40; $page++) {
+              $seen = $all.Count
+              $r = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/commits/$env:SHA/status?limit=50&page=$page"
+              foreach ($s in @($r.statuses | Where-Object { $_ })) { $all[$s.context] = $s }
+              if ($all.Count -eq $seen) { break }
+            }
+            $all
+          }
+          function Get-State($s) {
+            if (-not $s) { 'missing' } elseif ($s.PSObject.Properties['status']) { $s.status } else { $s.state }
+          }
+          function Test-Green($id, $s) {
+            $st = Get-State $s
+            ($st -eq 'success') -or ($st -eq 'warning' -and $optional -contains $id -and "$($s.description)" -cmatch '^n/a: \S')
+          }
+          function Set-Output($line) {
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "$line`n", (New-Object System.Text.UTF8Encoding $false))
+          }
+          $ids = @($env:IDS -split ',')
+          $optional = @($env:OPTIONAL -split ',' | Where-Object { $_ })
+
+          $recipe = $null
+          git fetch -q --no-tags --depth 1 origin +refs/heads/release:refs/remotes/origin/release
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::warning::release could not be fetched, so its recipe cannot be read'
+          } elseif (git ls-tree --name-only refs/remotes/origin/release -- recipe.ps1) {
+            $recipe = (git show refs/remotes/origin/release:recipe.ps1) -join "`n"
+          } else {
+            $recipe = [System.IO.File]::ReadAllText((Join-Path $PWD 'recipe.ps1'))
+          }
+          $reviewers = @(); $phrase = ''
+          if ($recipe) {
+            $m = [regex]::Match($recipe, '(?m)^[ \t]*\$Reviewers[ \t]*=[ \t]*@\(([^)]*)\)')
+            if ($m.Success) {
+              $reviewers = @([regex]::Matches($m.Groups[1].Value, '[''"]([^''"]+)[''"]') |
+                ForEach-Object { $_.Groups[1].Value })
+            }
+            $p = [regex]::Match($recipe, '(?m)^[ \t]*\$OverridePhrase[ \t]*=[ \t]*[''"]([^''"]+)[''"]')
+            if ($p.Success) { $phrase = $p.Groups[1].Value }
+          }
+          if (-not $phrase -or -not $reviewers) {
+            Write-Host '::warning::no $OverridePhrase or no $Reviewers could be read from the recipe - only the tests can end this wait'
+          }
+          $own = '(?m)^\s*' + [regex]::Escape($phrase) + '\s*$'
+          $inv = [Globalization.CultureInfo]::InvariantCulture
+          $headAt = [DateTimeOffset]::Parse("$(git log -1 --format=%cI $env:SHA)", $inv)
+          $arrived = $false
+
+          $deadline = (Get-Date).AddMinutes([int]$env:WAIT_MINUTES)
+          $final = $null
+          $failed = 0
+          while ((Get-Date) -lt $deadline) {
+            try {
+              $states = Get-States
+              $state = Get-State $states['manual/verdict']
+              if ($state -eq 'success') { $final = 'success'; break }
+              if ($phrase -and $reviewers) {
+                if (-not $arrived) {
+                  $first = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/statuses/$($env:SHA)?sort=oldest&limit=1"
+                  foreach ($s in @($first | Where-Object { $_.created_at })) {
+                    $at = [DateTimeOffset]::Parse($s.created_at, $inv)
+                    if ($at -gt $headAt) { $headAt = $at }
+                  }
+                  $arrived = $true
+                }
+                $hit = $null
+                $comments = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/issues/$env:PR/comments"
+                foreach ($c in $comments) {
+                  if ($reviewers -notcontains $c.user.login) { continue }
+                  $at = [DateTimeOffset]::Parse($c.created_at, $inv)
+                  if ($at -le $headAt) { continue }
+                  $text = "$($c.body)"
+                  if ($text -cmatch $own -and $text -cmatch '(?m)^Why: (\S.*)$') {
+                    $hit = @{ login = $c.user.login; why = $Matches[1].Trim(); url = $c.html_url
+                              at = $at.ToString('yyyy-MM-dd HH:mm') }
+                  }
+                }
+                if ($hit) {
+                  $why = $hit.why
+                  if ($why.Length -gt 100) { $why = $why.Substring(0, 100) }
+                  Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/statuses/$env:SHA" `
+                    -Headers $h -ContentType 'application/json; charset=utf-8' -Body (@{
+                      context = 'manual/verdict'; state = 'success'
+                      description = "override by $($hit.login): $why"
+                      target_url  = $hit.url } | ConvertTo-Json)
+                  Write-Host "the manual round was set aside by $($hit.login): $($hit.why)"
+                  Set-Output 'override=true'
+                  Set-Output "note=The manual round was set aside by $($hit.login) on $($hit.at). Why: $($hit.why)"
+                  exit 0
+                }
+              }
+              $failed = 0
+            } catch {
+              $failed++
+              Write-Host "$(Get-Date -Format HH:mm:ss) poll failed: $($_.Exception.Message)"
+              if ($failed -ge 10) {
+                Write-Host "::error::the server failed $failed polls in a row. Re-run this job to resume; test states are preserved."
+                exit 1
+              }
+              Start-Sleep -Seconds 30
+              continue
+            }
+            if ($state -in 'failure', 'error') { $final = 'failure'; break }
+            $green = @($ids | Where-Object { Test-Green $_ $states["manual/$_"] }).Count
+            $left = [int]($deadline - (Get-Date)).TotalMinutes
+            Write-Host "$(Get-Date -Format HH:mm:ss) waiting: $green/$($ids.Count) green, verdict=$state, $left min left"
+            Start-Sleep -Seconds 30
+          }
+          if (-not $final) {
+            Write-Host '::error::timed out waiting for the manual verdict. Re-run this job to resume; test states are preserved.'
+            exit 1
+          }
+          if ($final -ne 'success') {
+            Write-Host '::error::manual tests not all green - fix them through test, or set the round aside with the owner''s override (section 8)'
+            exit 1
+          }
+
+      - name: Believe no verdict without the tests behind it
+        if: steps.list.outputs.count != '0' && steps.wait.outputs.override != 'true'
+        env:
+          IDS:      ${{ steps.list.outputs.ids }}
+          OPTIONAL: ${{ steps.list.outputs.optional }}
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          function Get-States {
+            $all = @{}
+            for ($page = 1; $page -le 40; $page++) {
+              $seen = $all.Count
+              $r = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/commits/$env:SHA/status?limit=50&page=$page"
+              foreach ($s in @($r.statuses | Where-Object { $_ })) { $all[$s.context] = $s }
+              if ($all.Count -eq $seen) { break }
+            }
+            $all
+          }
+          function Get-State($s) {
+            if (-not $s) { 'missing' } elseif ($s.PSObject.Properties['status']) { $s.status } else { $s.state }
+          }
+          $optional = @($env:OPTIONAL -split ',' | Where-Object { $_ })
+          $states = Get-States
+          $bad = @()
+          foreach ($id in ($env:IDS -split ',')) {
+            $s = $states["manual/$id"]
+            $state = Get-State $s
+            if ($state -eq 'success') { continue }
+            if ($state -eq 'warning' -and "$($s.description)" -cmatch '^n/a: \S') {
+              if ($optional -contains $id) { continue }
+              $bad += "manual/$id = n/a, but the entry is blocking"
+            } else {
+              $bad += "manual/$id = $state"
+            }
+          }
+          if ($bad) {
+            Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/statuses/$env:SHA" `
+              -Headers $h -ContentType 'application/json' -Body (@{
+                context = 'manual/verdict'; state = 'failure'
+                description = 'verdict rejected: tests not all green'
+                target_url  = "$env:GITEA_URL/$env:REPO/pulls/$env:PR" } | ConvertTo-Json)
+            $bad | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+
+      - name: Write the report, green or red
+        if: always() && steps.list.outputs.count != '0'
+        env:
+          OVERRIDE_NOTE: ${{ steps.wait.outputs.note }}
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          function Get-States {
+            $all = @{}
+            for ($page = 1; $page -le 40; $page++) {
+              $seen = $all.Count
+              $r = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/commits/$env:SHA/status?limit=50&page=$page"
+              foreach ($s in @($r.statuses | Where-Object { $_ })) { $all[$s.context] = $s }
+              if ($all.Count -eq $seen) { break }
+            }
+            $all
+          }
+          function Get-State($s) {
+            if (-not $s) { 'missing' } elseif ($s.PSObject.Properties['status']) { $s.status } else { $s.state }
+          }
+          function Cell($x) { ("$x" -replace '\|', '\|') -replace '\s*[\r\n]+\s*', ' ' }
+          $lines = @("# Manual test report - $env:REPO PR #$env:PR", "",
+                     "Commit: ``$env:SHA``", "Date: $(Get-Date -Format s)", "")
+          if ($env:OVERRIDE_NOTE) { $lines += $env:OVERRIDE_NOTE, "" }
+          $tests = $null
+          try {
+            $tests = ([System.IO.File]::ReadAllText((Join-Path $PWD 'tests/manual/tests.json')) | ConvertFrom-Json).tests
+          } catch { $tests = $null }
+          if ($tests -isnot [array]) {
+            $lines += 'The manual test list could not be read - the run log names the cause.'
+          } else {
+            $states = Get-States
+            $lines += '| id | title | state | note |', '|---|---|---|---|'
+            foreach ($t in $tests) {
+              $s = $states["manual/$($t.id)"]
+              $lines += "| $(Cell $t.id) | $(Cell $t.title) | $(Get-State $s) | $(Cell $s.description) |"
+            }
+          }
+          $lines += ""
+          $lines += "Evidence, where a tester attached any, lives under:"
+          $lines += "$env:GITEA_URL/api/packages/$env:OWNER/generic/$env:NAME-manual-evidence/$env:SHA/"
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'manual-report.md'),
+              ($lines -join "`n") + "`n", (New-Object System.Text.UTF8Encoding $false))
+
+      - name: Keep the report where the release can find it
+        if: always()
+        run: |
+          $url = "$env:GITEA_URL/api/packages/$env:OWNER/generic/$env:NAME-manual-reports/$env:SHA/manual-report.md"
+          curl.exe -s -X DELETE -H "Authorization: token $env:TOKEN" $url
+          curl.exe -sf -H "Authorization: token $env:TOKEN" --upload-file manual-report.md $url
+
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: manual-report
+          path: manual-report.md

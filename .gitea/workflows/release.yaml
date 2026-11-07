@@ -1,0 +1,431 @@
+name: release
+on:
+  push:
+    branches: [release]
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  publish:
+    name: publish
+    runs-on: windows
+    timeout-minutes: 60
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      GITEA_URL:   ${{ github.server_url }}
+      GITEA_API:   ${{ github.server_url }}/api/v1
+      OWNER:       igors-lab
+      REPO:        ${{ github.repository }}
+      NAME:        ${{ github.event.repository.name }}
+      BEFORE:      ${{ github.event.before }}
+      ACTOR:       ${{ github.actor }}
+      TOKEN:       ${{ secrets.LAB_BOT_TOKEN }}
+      GITEA_TOKEN: ${{ secrets.LAB_BOT_TOKEN }}
+      GIT_CONFIG_COUNT:   '1'
+      GIT_CONFIG_KEY_0:   http.${{ github.server_url }}/.extraHeader
+      GIT_CONFIG_VALUE_0: 'Authorization: token ${{ secrets.LAB_BOT_TOKEN }}'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          lfs: true
+
+      - name: lab-bot, and every tag
+        run: |
+          git config user.name 'lab-bot'
+          git config user.email 'lab-bot@igors-lab.local'
+          git fetch -q --tags --force origin
+          exit $LASTEXITCODE
+
+      - name: Version from recipe.ps1
+        id: ver
+        run: |
+          $m = Select-String -Path recipe.ps1 -Pattern '^\s*\$Version\s*=\s*[''"]([^''"]+)[''"]'
+          if (-not $m) { Write-Host '::error::recipe.ps1 has no $Version = ''x.y.z'' line'; exit 1 }
+          $v = $m.Matches[0].Groups[1].Value
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT,
+              "version=$v`n", (New-Object System.Text.UTF8Encoding $false))
+          if (git tag -l "v$v") {
+            Write-Host "::warning::tag v$v already exists - nothing to publish. Bump `$Version to publish."
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT,
+                "skip=true`n", (New-Object System.Text.UTF8Encoding $false))
+          } else {
+            [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT,
+                "skip=false`n", (New-Object System.Text.UTF8Encoding $false))
+          }
+
+      - name: App or library
+        id: kind
+        run: |
+          $m = Select-String -Path recipe.ps1 -Pattern '^\s*\$App\s*=\s*[''"]([^''"]+)[''"]'
+          $p = Select-String -Path recipe.ps1 -Pattern '^\s*\$Provides\s*=\s*@\(\s*[''"][^''"]+[''"]'
+          $app   = if ($m) { 'true' } else { 'false' }
+          $ships = if ($m -or $p) { 'true' } else { 'false' }
+          Write-Host "app=$app ships=$ships"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "app=$app`nships=$ships`n", (New-Object System.Text.UTF8Encoding $false))
+
+      - name: Build installer
+        if: steps.ver.outputs.skip == 'false'
+        run: .\recipe.ps1 build; exit $LASTEXITCODE
+
+      - name: Release notes - every commit, and its issues
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $h   = @{ Authorization = "token $env:TOKEN" }
+          $enc = New-Object System.Text.UTF8Encoding $false
+          $tags  = @(git tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname)
+          $last  = if ($tags.Count) { $tags[0] } else { $null }
+          $range = if ($last) { "$last..HEAD" } else { 'HEAD' }
+
+          $commits = @(git log --no-merges --invert-grep --grep '^docs(docs): changelog for v' `
+                         --format='- %h %s' $range)
+
+          $m = Select-String -Path recipe.ps1 -Encoding UTF8 -Pattern '^\s*\$Code\s*=\s*[''"]([^''"]+)[''"]'
+          if (-not $m) { Write-Host '::error::recipe.ps1 has no $Code line'; exit 1 }
+          $code = [regex]::Escape($m.Matches[0].Groups[1].Value)
+          $nums = @(); $ships = @()
+          foreach ($s in (git log --format=%s $range)) {
+            if ($s -cmatch "^Merge .* from $code-([0-9]+)/") {
+              $nums += [int]$Matches[1]; $ships += [int]$Matches[1]
+              if ($s -cmatch '\(#([0-9]+)\)') { $nums += [int]$Matches[1] }
+            } elseif ($s -cmatch '^[a-z]+\([a-z0-9._-]+\): ') {
+              foreach ($x in [regex]::Matches($s, '#([0-9]+)\b')) { $nums += [int]$x.Groups[1].Value }
+            }
+          }
+          $issues = @(); $prs = @(); $toClose = @()
+          foreach ($n in ($nums | Sort-Object -Unique)) {
+            try { $i = Invoke-RestMethod -Uri "$env:GITEA_API/repos/$env:REPO/issues/$n" -Headers $h }
+            catch {
+              if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) { continue }
+              throw
+            }
+            $line = "- #$n $($i.title) ($($i.state))"
+            if ($i.pull_request) { $prs += $line }
+            else {
+              $issues += $line
+              if ($i.state -eq 'open' -and $ships -contains $n) { $toClose += $n }
+            }
+          }
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'issues-to-close.txt'), ($toClose -join "`n"), $enc)
+
+          $v = $env:VERSION
+          $from = if ($last) { $last } else { 'the beginning' }
+          $body = @("## v$v ($(Get-Date -Format yyyy-MM-dd))", '',
+                    "### Commits since $from", '') + $commits +
+                  @('', '### Issues', '') + $(if ($issues) { $issues } else { @('- none referenced') }) +
+                  @('', '### Pull requests', '') + $(if ($prs) { $prs } else { @('- none referenced') })
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'release-body.md'), ($body -join "`n"), $enc)
+
+      - name: Record overrides
+        id: ovr
+        if: success() || failure()
+        run: |
+          if (-not $env:BEFORE -or $env:BEFORE -match '^0+$') {
+            Write-Host 'release was created by this push - the bootstrap, nothing to record'
+            exit 0
+          }
+          $h    = @{ Authorization = "token $env:TOKEN" }
+          $enc  = New-Object System.Text.UTF8Encoding $false
+          $json = 'application/json; charset=utf-8'
+          $shas = @(git rev-list --first-parent "$env:BEFORE..$env:GITHUB_SHA")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::git cannot read $env:BEFORE..$env:GITHUB_SHA - this push cannot be judged"
+            exit 1
+          }
+
+          if (git ls-tree --name-only $env:BEFORE -- recipe.ps1) {
+            $recipe = (git show "$($env:BEFORE):recipe.ps1") -join "`n"
+          } else {
+            $recipe = [System.IO.File]::ReadAllText((Join-Path $PWD 'recipe.ps1'))
+          }
+          $p = [regex]::Match($recipe, '(?m)^[ \t]*\$OverridePhrase[ \t]*=[ \t]*[''"]([^''"]+)[''"]')
+          $phrase = if ($p.Success) { $p.Groups[1].Value } else { $null }
+          $r = [regex]::Match($recipe, '(?m)^[ \t]*\$Reviewers[ \t]*=[ \t]*@\(([^)]*)\)')
+          $reviewers = @()
+          if ($r.Success) {
+            $reviewers = @([regex]::Matches($r.Groups[1].Value, '[''"]([^''"]+)[''"]') |
+              ForEach-Object { $_.Groups[1].Value })
+          }
+
+          function Get-Why($text) {
+            if (-not $text -or -not $phrase) { return $null }
+            if ("$text" -cnotmatch ('(?m)^\s*' + [regex]::Escape($phrase) + '\s*$')) { return $null }
+            $w = [regex]::Match("$text", '(?m)^Why: (\S.*)$')
+            if ($w.Success) { return $w.Groups[1].Value.Trim() }
+            return $null
+          }
+          function Get-Statuses($sha) {
+            $all = @{}
+            for ($page = 1; $page -le 40; $page++) {
+              $seen = $all.Count
+              $got = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/commits/$sha/status?limit=50&page=$page"
+              foreach ($s in @($got.statuses | Where-Object { $_ })) { $all[$s.context] = $s }
+              if ($all.Count -eq $seen) { break }
+            }
+            $all
+          }
+          function Get-State($states, $context) {
+            $s = $states[$context]
+            if (-not $s) { return 'missing', '' }
+            $state = if ($s.PSObject.Properties['status']) { $s.status } else { $s.state }
+            return $state, "$($s.description)"
+          }
+
+          $records = @(); $unexplained = @(); $direct = @(); $onPr = @{}; $unproven = $false
+          foreach ($sha in $shas) {
+            $pr = $null
+            try { $pr = Invoke-RestMethod -Uri "$env:GITEA_API/repos/$env:REPO/commits/$sha/pull" -Headers $h }
+            catch {
+              if (-not ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404)) { throw }
+            }
+            if (-not $pr -or "$($pr.base.ref)" -cne 'release') { $direct += $sha; continue }
+
+            $parents = (git rev-list --parents -n 1 $sha) -split ' '
+            $head    = if ($parents.Count -ge 3) { $parents[2] } else { $pr.head.sha }
+            $states  = Get-Statuses $head
+            $verdict, $vdesc = Get-State $states 'manual/verdict'
+            $checks,  $cdesc = Get-State $states 'release-gate / checks (pull_request)'
+            if ($verdict -eq 'success' -and $checks -eq 'success') {
+              if ($vdesc -cmatch '^override by (\S+): (.+)$') {
+                $line = "- PR #$($pr.number): the manual round set aside by $($Matches[1]). Why: $($Matches[2])"
+                $records += $line; $onPr["$($pr.number)"] = $line
+              }
+              continue
+            }
+            $unproven = $true
+            $who = if ($pr.merged_by) { $pr.merged_by.login } else { $env:ACTOR }
+            $why = $null
+            if ($reviewers -contains $pr.user.login) {
+              $w = Get-Why $pr.body
+              if ($w) { $why = "Why (by $($pr.user.login)): $w" }
+            }
+            if (-not $why) {
+              $comments = Invoke-RestMethod -Uri "$env:GITEA_API/repos/$env:REPO/issues/$($pr.number)/comments" -Headers $h
+              foreach ($c in $comments) {
+                if ($reviewers -notcontains $c.user.login) { continue }
+                $w = Get-Why $c.body
+                if ($w) { $why = "Why (by $($c.user.login)): $w" }
+              }
+            }
+            $line = "- PR #$($pr.number): merged by $who with manual/verdict=$verdict, checks=$checks."
+            if ($why) { $line = "$line $why" }
+            else { $line = "$line No Why: given."; $unexplained += "PR #$($pr.number)" }
+            $records += $line; $onPr["$($pr.number)"] = $line
+          }
+          if ($direct.Count) {
+            $unproven = $true
+            $why = $null
+            foreach ($sha in $direct) {
+              $w = Get-Why ((git log -1 --format=%B $sha) -join "`n")
+              if ($w) { $why = $w; break }
+            }
+            $list = ($direct | ForEach-Object { $_.Substring(0, 7) }) -join ', '
+            $line = "- a direct push by $($env:ACTOR): $list."
+            if ($why) { $records += "$line Why: $why" }
+            else { $records += "$line No Why: given."; $unexplained += "commits $list" }
+          }
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT,
+              "prerelease=$(if ($unproven) { 'true' } else { 'false' })`n", $enc)
+          if ($records.Count -eq 0) { Write-Host 'no override in this push'; exit 0 }
+          $records | ForEach-Object { Write-Host $_ }
+
+          $notes = Join-Path $PWD 'release-body.md'
+          if (Test-Path $notes) {
+            $text = [System.IO.File]::ReadAllText($notes) + "`n`n### Overrides`n`n" + ($records -join "`n")
+            if ($unproven) {
+              $text += "`n`nPublished as a pre-release: this push holds a merge past a red or missing check, or a direct push, so release-gate never proved this installer."
+            }
+            [System.IO.File]::WriteAllText($notes, $text, $enc)
+          } elseif (-not (git tag --points-at $env:GITHUB_SHA --list 'v[0-9]*')) {
+            foreach ($n in @($onPr.Keys)) {
+              $msg = "release.yaml recorded this merge as the owner's override. This push to release " +
+                     "published no version, so the record is kept here:`n`n$($onPr[$n])"
+              try {
+                Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$n/comments" `
+                  -Headers $h -ContentType $json -Body (@{ body = $msg } | ConvertTo-Json) | Out-Null
+              } catch { Write-Host "::warning::the record could not be written on PR #${n}: $_" }
+            }
+          }
+          if ($unexplained.Count -eq 0) { exit 0 }
+
+          $title = "release changed past the gate without the owner's override"
+          $body  = "The push $($env:BEFORE.Substring(0, 7))..$($env:GITHUB_SHA.Substring(0, 7)) changed release " +
+                   "and nothing says why: $($unexplained -join '; '). Write the reason here - the owner's override " +
+                   "is the recipe's `$OverridePhrase and a Why: line, by a name in `$Reviewers (BEST_REQUIREMENTS section 8)."
+          try {
+            $open = Invoke-RestMethod -Headers $h `
+              -Uri "$env:GITEA_API/repos/$env:REPO/issues?state=open&type=issues&limit=50&q=$([uri]::EscapeDataString($title))"
+            $same = $null
+            foreach ($i in $open) { if ($i.title -ceq $title) { $same = $i; break } }
+            if ($same) {
+              Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$($same.number)/comments" `
+                -Headers $h -ContentType $json -Body (@{ body = $body } | ConvertTo-Json) | Out-Null
+            } else {
+              Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues" `
+                -Headers $h -ContentType $json `
+                -Body (@{ title = $title; body = $body } | ConvertTo-Json) | Out-Null
+            }
+            Write-Host "::warning::release changed past the gate with no Why: line - see the issue '$title'"
+          } catch { Write-Host "::warning::the issue '$title' could not be written: $_" }
+          exit 0
+
+      - name: Create the release, attach the installer and the report
+        if: steps.ver.outputs.skip == 'false'
+        id: rel
+        env:
+          VERSION:    ${{ steps.ver.outputs.version }}
+          PRERELEASE: ${{ steps.ovr.outputs.prerelease }}
+        run: |
+          $h   = @{ Authorization = "token $env:TOKEN" }
+          $enc = New-Object System.Text.UTF8Encoding $false
+          $v   = $env:VERSION
+          $body = [System.IO.File]::ReadAllText((Join-Path $PWD 'release-body.md'))
+          $rel = Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/releases" `
+            -Headers $h -ContentType 'application/json; charset=utf-8' -Body (@{
+              tag_name = "v$v"; target_commitish = $env:GITHUB_SHA; name = "v$v"
+              body = $body; draft = $false; prerelease = ($env:PRERELEASE -eq 'true') } | ConvertTo-Json)
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "id=$($rel.id)`n", $enc)
+
+          $exe = Get-ChildItem dist -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($exe) {
+            curl.exe -sf -X POST -H "Authorization: token $env:TOKEN" `
+              -F "attachment=@$($exe.FullName)" `
+              "$env:GITEA_API/repos/$env:REPO/releases/$($rel.id)/assets?name=$($exe.Name)"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::the installer $($exe.Name) was not attached"; exit 1 }
+          }
+
+          $parents = (git rev-list --parents -n 1 HEAD) -split ' '
+          $prHead  = if ($parents.Count -ge 3) { $parents[2] } else { '' }
+          Remove-Item manual-report.md -ErrorAction SilentlyContinue
+          if ($prHead) {
+            curl.exe -sf -o manual-report.md -H "Authorization: token $env:TOKEN" `
+              "$env:GITEA_URL/api/packages/$env:OWNER/generic/$env:NAME-manual-reports/$prHead/manual-report.md"
+            if ($LASTEXITCODE -ne 0) { Remove-Item manual-report.md -ErrorAction SilentlyContinue }
+          }
+          if (-not (Test-Path manual-report.md)) {
+            [System.IO.File]::WriteAllText((Join-Path $PWD 'manual-report.md'),
+                'No manual test report was recorded for this release.', $enc)
+          }
+          curl.exe -sf -X POST -H "Authorization: token $env:TOKEN" `
+            -F "attachment=@manual-report.md" `
+            "$env:GITEA_API/repos/$env:REPO/releases/$($rel.id)/assets?name=manual-report.md"
+
+      - name: SBOM - what this build was made of
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          VERSION:    ${{ steps.ver.outputs.version }}
+          RELEASE_ID: ${{ steps.rel.outputs.id }}
+        run: |
+          $meta = Select-String -Path recipe.ps1 -Pattern '^\s*\$(Needs|Tools|Version)\s*=' |
+            ForEach-Object { $_.Line.Trim() }
+          $lines = @("# SBOM - v$env:VERSION", '', '```') + $meta + @('```')
+          if (Test-Path uv.lock) {
+            $lines += @('', '## uv.lock', '', '```') + (Get-Content uv.lock -Encoding UTF8) + @('```')
+          }
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'sbom.md'), ($lines -join "`n"),
+              (New-Object System.Text.UTF8Encoding $false))
+          curl.exe -sf -X POST -H "Authorization: token $env:TOKEN" `
+            -F "attachment=@sbom.md" `
+            "$env:GITEA_API/repos/$env:REPO/releases/$env:RELEASE_ID/assets?name=sbom.md"
+
+      - name: Close the issues the release ships
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          $v = $env:VERSION
+          foreach ($n in (Get-Content issues-to-close.txt -ErrorAction SilentlyContinue | Where-Object { $_ })) {
+            try {
+              Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$n/comments" `
+                -Headers $h -ContentType 'application/json; charset=utf-8' `
+                -Body (@{ body = "Shipped in v$v." } | ConvertTo-Json)
+              Invoke-RestMethod -Method Patch -Uri "$env:GITEA_API/repos/$env:REPO/issues/$n" `
+                -Headers $h -ContentType 'application/json; charset=utf-8' `
+                -Body (@{ state = 'closed' } | ConvertTo-Json)
+            } catch { Write-Host "::warning::issue #${n} stays open: $_" }
+          }
+
+      - name: Bring test level with release
+        id: sync
+        if: success() || failure()
+        run: |
+          $h   = @{ Authorization = "token $env:TOKEN" }
+          $enc = New-Object System.Text.UTF8Encoding $false
+          git fetch -q --no-tags origin +refs/heads/test:refs/remotes/origin/test
+          if ($LASTEXITCODE -ne 0) { Write-Host '::warning::could not fetch test - it is not brought level by this run'; exit 0 }
+          $sync = Join-Path $env:TEMP ('sync-' + [guid]::NewGuid().ToString('N'))
+          git worktree add -q --detach $sync refs/remotes/origin/test
+          if ($LASTEXITCODE -ne 0) { Write-Host '::warning::could not check test out - it is not brought level by this run'; exit 0 }
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "dir=$sync`n", $enc)
+
+          $missing = @(git rev-list --no-merges "refs/remotes/origin/test..$env:GITHUB_SHA")
+          if ($missing.Count -eq 0) { Write-Host 'test already contains everything release does'; exit 0 }
+          git -C $sync merge -q --no-ff $env:GITHUB_SHA -m "Merge branch 'release' into test"
+          if ($LASTEXITCODE -eq 0) {
+            git -C $sync push -q origin HEAD:test
+            if ($LASTEXITCODE -eq 0) { Write-Host "test brought level: $($missing.Count) commit(s) from release"; exit 0 }
+            $why = 'the push to test was refused'
+          } else {
+            git -C $sync merge --abort
+            $why = 'release does not merge into test without conflicts'
+          }
+          Write-Host "::warning::test is behind release: $why"
+
+          $title = 'test is behind release'
+          $body  = "release has $($missing.Count) commit(s) test does not ($why, run $env:GITHUB_RUN_ID). " +
+                   "Bring them over like any other work: a branch from test for this issue, " +
+                   "git merge origin/release, resolve, .\recipe.ps1 test, a pull request into test (R-40)."
+          $open = Invoke-RestMethod -Headers $h `
+            -Uri "$env:GITEA_API/repos/$env:REPO/issues?state=open&type=issues&limit=50&q=$([uri]::EscapeDataString($title))"
+          $same = $null
+          foreach ($i in $open) { if ($i.title -ceq $title) { $same = $i; break } }
+          try {
+            if ($same) {
+              Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$($same.number)/comments" `
+                -Headers $h -ContentType 'application/json; charset=utf-8' -Body (@{ body = $body } | ConvertTo-Json) | Out-Null
+            } else {
+              Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues" `
+                -Headers $h -ContentType 'application/json; charset=utf-8' `
+                -Body (@{ title = $title; body = $body } | ConvertTo-Json) | Out-Null
+            }
+          } catch { Write-Host "::warning::the issue '$title' could not be written: $_" }
+          exit 0
+
+      - name: Changelog - written by the release onto test, never by hand
+        if: steps.ver.outputs.skip == 'false' && steps.kind.outputs.ships == 'true' && steps.sync.outputs.dir != ''
+        env:
+          VERSION:  ${{ steps.ver.outputs.version }}
+          SYNC_DIR: ${{ steps.sync.outputs.dir }}
+        run: |
+          $enc  = New-Object System.Text.UTF8Encoding $false
+          $v    = $env:VERSION
+          $file = Join-Path $env:SYNC_DIR 'CHANGELOG.md'
+          $new  = [System.IO.File]::ReadAllText((Join-Path $PWD 'release-body.md'))
+          $old  = if (Test-Path $file) { [System.IO.File]::ReadAllText($file) -replace '^# Changelog\s*', '' } else { '' }
+          $text = "# Changelog`n`n$new`n"
+          if ($old) { $text += "`n$old" }
+          [System.IO.File]::WriteAllText($file, $text, $enc)
+          git -C $env:SYNC_DIR add CHANGELOG.md
+          git -C $env:SYNC_DIR commit -q -s -m "docs(docs): changelog for v$v"
+          if ($LASTEXITCODE -eq 0) { git -C $env:SYNC_DIR push -q origin HEAD:test }
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::the changelog for v$v did not reach test - the release stands, and its notes are on the release page"
+          }
+          exit 0
+
+      - name: Leave the runner clean
+        if: always()
+        env:
+          SYNC_DIR: ${{ steps.sync.outputs.dir }}
+        run: |
+          if ($env:SYNC_DIR) { git worktree remove --force $env:SYNC_DIR }
+          git worktree prune
+          exit 0

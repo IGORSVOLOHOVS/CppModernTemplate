@@ -1,0 +1,2 @@
+# Pinned where recipe.ps1 points ruff (section 6, R-14): any other version refuses to run.
+required-version = "==0.16.1"

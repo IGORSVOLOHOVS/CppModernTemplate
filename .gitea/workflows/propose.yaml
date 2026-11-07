@@ -1,0 +1,193 @@
+name: propose
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    branches: [test]
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  gate:
+    name: gate
+    runs-on: windows
+    timeout-minutes: 60
+    env:
+      GITEA_API: ${{ github.server_url }}/api/v1
+      REPO:      ${{ github.repository }}
+      PR:        ${{ github.event.pull_request.number }}
+      HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+      BASE_SHA:  ${{ github.event.pull_request.base.sha }}
+      POSTER:    ${{ github.event.pull_request.user.login }}
+      HEAD_REF:  ${{ github.head_ref }}
+      TOKEN:       ${{ secrets.LAB_BOT_TOKEN }}
+      GITEA_TOKEN: ${{ secrets.LAB_BOT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: Branch name check
+        run: |
+          $branch = $env:HEAD_REF
+          if (-not $branch) {
+            Write-Host '::error::the pull request has no head ref - the branch name cannot be judged'
+            exit 1
+          }
+          if ($branch -clike 'from-*') {
+            Write-Host "imported branch '$branch' is exempt from the branch grammar"
+            exit 0
+          }
+          if (-not (Test-Path recipe.ps1)) {
+            Write-Host '::error::recipe.ps1 is missing - section 7 requires it at the repository root'
+            exit 1
+          }
+          $recipe = Get-Content recipe.ps1 -Raw -Encoding UTF8
+          $c = [regex]::Match($recipe, '(?m)^\s*\$Code\s*=\s*[''"]([^''"]+)[''"]')
+          if (-not $c.Success) {
+            Write-Host '::error::recipe.ps1 names no $Code - the branch name cannot be judged'
+            exit 1
+          }
+          $code = $c.Groups[1].Value
+          $b = [regex]::Match($recipe, '(?m)^\s*\$BranchTypes\s*=\s*([^#\r\n]*)')
+          if ($b.Success -and $b.Groups[1].Value.Contains('$')) {
+            Write-Host '::error::$BranchTypes in recipe.ps1 must be a literal list - it is read as text, never run (section 6)'
+            exit 1
+          }
+          $types = @()
+          if ($b.Success) {
+            $types = @([regex]::Matches($b.Groups[1].Value, '[''"]([^''"]+)[''"]') |
+              ForEach-Object { $_.Groups[1].Value })
+          }
+          if (-not $types) {
+            Write-Host '::error::recipe.ps1 names no $BranchTypes - the branch name cannot be judged'
+            exit 1
+          }
+          $alt = ($types | ForEach-Object { [regex]::Escape($_) }) -join '|'
+          $re = "^$([regex]::Escape($code))-[1-9][0-9]*/($alt)/[a-z0-9]+(-[a-z0-9]+)*$"
+          if ($branch -cnotmatch $re) {
+            Write-Host "::error::Branch '$branch' violates $code-<issue>/<type>/<slug>, e.g. $code-7/feat/scanner-timeout"
+            exit 1
+          }
+          Write-Host "branch '$branch' follows $code-<issue>/<type>/<slug>"
+
+      - name: Commit wording check
+        run: |
+          git fetch --no-tags origin +refs/heads/test:refs/remotes/origin/test +refs/heads/release:refs/remotes/origin/release
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::could not fetch origin/test and origin/release - the commit wording check cannot run, so it fails'
+            exit 1
+          }
+          $base = ''
+          if ($env:BASE_SHA) {
+            git cat-file -e $env:BASE_SHA
+            if ($LASTEXITCODE -eq 0) { $base = git merge-base $env:BASE_SHA HEAD }
+          }
+          if (-not $base) { $base = git merge-base refs/remotes/origin/test HEAD }
+          if ($LASTEXITCODE -ne 0 -or -not $base) {
+            Write-Host '::error::no merge base between test and HEAD - the check cannot run, so it fails'
+            exit 1
+          }
+          $base = "$base".Trim()
+          $arrived = @(git rev-list "$base..HEAD")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::git rev-list $base..HEAD failed - the check cannot run, so it fails"
+            exit 1
+          }
+          if ($arrived.Count -eq 0) {
+            Write-Host '::error::no commits between test and HEAD - nothing arrived, which cannot be right for a pull request'
+            exit 1
+          }
+          $shas = @(git rev-list --no-merges "$base..HEAD" --not refs/remotes/origin/release)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::git rev-list $base..HEAD --not origin/release failed - the check cannot run, so it fails"
+            exit 1
+          }
+          if ($shas.Count -eq 0) {
+            Write-Host "merge-only pull request: nothing to word-check ($($arrived.Count) commit(s) arrived, each a merge or already on release)"
+            exit 0
+          }
+          if (-not (Test-Path recipe.ps1)) {
+            Write-Host '::error::recipe.ps1 is missing - section 7 requires it at the repository root'
+            exit 1
+          }
+          $recipe = Get-Content recipe.ps1 -Raw -Encoding UTF8
+          function Read-List([string]$Name) {
+            $m = [regex]::Match($recipe, "(?m)^\s*\`$$Name\s*=\s*([^#\r\n]*)")
+            if (-not $m.Success) { return @() }
+            return @([regex]::Matches($m.Groups[1].Value, '[''"]([^''"]+)[''"]') |
+              ForEach-Object { $_.Groups[1].Value })
+          }
+          $types  = Read-List 'CommitTypes'
+          $scopes = Read-List 'CommitScopes'
+          if (-not $types -or -not $scopes) {
+            Write-Host '::error::recipe.ps1 names no $CommitTypes/$CommitScopes - the subjects cannot be judged'
+            exit 1
+          }
+          $alt   = ($types  | ForEach-Object { [regex]::Escape($_) }) -join '|'
+          $scope = ($scopes | ForEach-Object { [regex]::Escape($_) }) -join '|'
+          $subRe = "^($alt)\(($scope)\): .+"
+          $bad = @()
+          foreach ($sha in $shas) {
+            $subject = git log -1 --format=%s $sha
+            $signed  = @(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' $sha) -match '.+ <.+@.+>'
+            if ($subject -cnotmatch $subRe) { $bad += "$($sha.Substring(0,7)) bad subject: $subject" }
+            if (-not $signed) { $bad += "$($sha.Substring(0,7)) missing Signed-off-by" }
+          }
+          if ($bad) { $bad | ForEach-Object { Write-Host "::error::$_" }; exit 1 }
+          Write-Host "$($shas.Count) commit(s) judged, all worded correctly"
+          exit 0
+
+      - name: Unit tests, lint, format
+        run: |
+          .\recipe.ps1 test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::the commit arrived unformatted - run .\recipe.ps1 test and commit the result'
+            exit 1
+          }
+
+      - name: Request review and notify the reviewers
+        if: github.event.action == 'opened' || github.event.action == 'reopened'
+        run: |
+          $m = Select-String -Path recipe.ps1 -Pattern '^\s*\$Reviewers\s*=\s*@\(([^)]*)\)'
+          $reviewers = @()
+          if ($m) {
+            $reviewers = @([regex]::Matches($m.Matches[0].Groups[1].Value,
+              '[''"]([^''"]+)[''"]') | ForEach-Object { $_.Groups[1].Value })
+          }
+          if (-not $reviewers) {
+            Write-Host '::error::recipe.ps1 names no $Reviewers on one line - every metadata value is a literal on one line (section 6)'
+            exit 1
+          }
+          if (-not $env:TOKEN) {
+            Write-Host '::warning::LAB_BOT_TOKEN is not visible to this repository - nobody was notified (section 8, Tokens)'
+            exit 0
+          }
+          $h = @{ Authorization = "token $env:TOKEN" }
+          $ask = @($reviewers | Where-Object { $_ -cne $env:POSTER })
+          if ($ask.Count -eq 0) {
+            Write-Host "no reviewer left to request: `$Reviewers names only the poster, $env:POSTER"
+          } else {
+            try {
+              Invoke-RestMethod -Method Post `
+                -Uri "$env:GITEA_API/repos/$env:REPO/pulls/$env:PR/requested_reviewers" `
+                -Headers $h -ContentType 'application/json' `
+                -Body (@{ reviewers = @($ask) } | ConvertTo-Json) | Out-Null
+              Write-Host "review requested from $($ask -join ', ')"
+            } catch { Write-Host "::warning::the review request was refused: $($_.Exception.Message)" }
+          }
+          $text = "the automated gate passed on ``$env:HEAD_SHA``; it may be merged into ``test``."
+          $ping = ($ask | ForEach-Object { "@$_" }) -join ' '
+          if ($ping) { $text = "$ping $text" }
+          try {
+            Invoke-RestMethod -Method Post `
+              -Uri "$env:GITEA_API/repos/$env:REPO/issues/$env:PR/comments" `
+              -Headers $h -ContentType 'application/json' `
+              -Body (@{ body = $text } | ConvertTo-Json) | Out-Null
+          } catch { Write-Host "::warning::the pull request comment was refused: $($_.Exception.Message)" }
+          exit 0
