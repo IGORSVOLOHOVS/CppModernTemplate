@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.ps1   text eol=crlf working-tree-encoding=UTF-8
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+.claude/hooks/git/commit-msg text eol=lf
+.claude/hooks/git/pre-push   text eol=lf
+tests/fixtures/** -text
+*.pdf filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.7z  filter=lfs diff=lfs merge=lfs -text
+*.exe binary
