@@ -1,0 +1,3 @@
+#!/bin/sh
+# Git for Windows runs hooks with its own sh.exe: this file hands the message to PowerShell.
+exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(dirname "$0")/commit-msg.ps1" "$1"
