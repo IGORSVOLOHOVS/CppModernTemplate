@@ -1,0 +1,120 @@
+name: test
+on:
+  push:
+    branches: [test]
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  prove:
+    name: prove
+    runs-on: windows
+    timeout-minutes: 60
+    concurrency:
+      group: installer-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      GITEA_URL:   ${{ github.server_url }}
+      REPO:        ${{ github.repository }}
+      TOKEN:       ${{ secrets.LAB_BOT_TOKEN }}
+      GITEA_TOKEN: ${{ secrets.LAB_BOT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test
+          persist-credentials: false
+          lfs: true
+      - name: Runner health
+        run: |
+          $free = [math]::Floor((Get-PSDrive C).Free / 1GB)
+          if ($free -lt 5) { Write-Host "::error::runner disk: only $free GB free on C:"; exit 1 }
+          if ($free -lt 20) { Write-Host "::warning::runner disk low: $free GB free on C: - clean it up" }
+          $uv = Test-Path uv.lock
+          foreach ($tool in 'python', 'ruff', 'pytest', 'mypy') {
+            $ok = $false
+            try {
+              if ($uv) { uv run --frozen $tool --version } else { & $tool --version }
+              $ok = ($LASTEXITCODE -eq 0)
+            } catch { $ok = $false }
+            if (-not $ok) { Write-Host "::error::runner health: $tool does not answer"; exit 1 }
+          }
+      - name: App or library
+        id: kind
+        run: |
+          $app = [bool](Select-String -Path recipe.ps1 -Pattern '^\s*\$App\s*=\s*[''"]([^''"]+)[''"]')
+          $lib = [bool](Select-String -Path recipe.ps1 -Pattern '^\s*\$Provides\s*=\s*@\(\s*[''"][^''"]+[''"]')
+          $ships = $app -or $lib
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT,
+              "app=$(if ($app) { 'true' } else { 'false' })`nships=$(if ($ships) { 'true' } else { 'false' })`n")
+      - name: Tests and formatting
+        run: |
+          .\recipe.ps1 test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code
+      - name: Build as publishing will
+        run: .\recipe.ps1 build; exit $LASTEXITCODE
+      - name: Pack as publishing will
+        if: steps.kind.outputs.app == 'true'
+        run: |
+          .\recipe.ps1 install
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::silent install failed'; exit 1 }
+          .\recipe.ps1 info
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::product not present after install'; exit 1 }
+          .\recipe.ps1 uninstall
+          if ($LASTEXITCODE -ne 0) { Write-Host '::error::silent uninstall failed'; exit 1 }
+          .\recipe.ps1 info
+          if ($LASTEXITCODE -eq 0) { Write-Host '::error::product still present after uninstall'; exit 1 }
+          exit 0
+      - name: Regenerate the wiki
+        if: steps.kind.outputs.ships == 'true'
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: http.${{ github.server_url }}/.extraHeader
+          GIT_CONFIG_VALUE_0: 'Authorization: token ${{ secrets.LAB_BOT_TOKEN }}'
+        run: |
+          $sha  = "$(git rev-parse HEAD)".Trim()
+          $wiki = "$env:GITEA_URL/$env:REPO.wiki.git"
+          $api  = "$env:GITEA_URL/api/v1/repos/$env:REPO"
+          $h    = @{ Authorization = "token $env:TOKEN" }
+
+          python tools/wiki.py --sha $sha
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::the wiki could not be generated - fix what tools/wiki.py names above'
+            exit 1
+          }
+
+          $why = ''
+          git ls-remote $wiki | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'the wiki repository does not answer - creating it with a first page'
+            try {
+              Invoke-RestMethod -Method Patch -Uri $api -Headers $h -ContentType 'application/json' `
+                -Body (@{ has_wiki = $true } | ConvertTo-Json) | Out-Null
+            } catch { $why += " has_wiki refused: $($_.Exception.Message);" }
+            try {
+              $page = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('Generated from test by tools/wiki.py.'))
+              Invoke-RestMethod -Method Post -Uri "$api/wiki/new" -Headers $h -ContentType 'application/json' `
+                -Body (@{ title = 'Home'; content_base64 = $page; message = 'docs(docs): create the wiki' } | ConvertTo-Json) | Out-Null
+            } catch { $why += " first page refused: $($_.Exception.Message);" }
+          }
+
+          python tools/wiki.py --push --wiki-url $wiki --sha $sha
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::wiki not published: tools/wiki.py --push exited $LASTEXITCODE;$why see its output above"
+          }
+          exit 0
+      - name: Leave the runner clean
+        if: always()
+        env:
+          IS_APP: ${{ steps.kind.outputs.app }}
+        run: |
+          if ($env:IS_APP -eq 'true') {
+            try { .\recipe.ps1 uninstall } catch { Write-Host "cleanup: uninstall skipped: $_" }
+          }
+          try { .\recipe.ps1 clean } catch { Write-Host "cleanup: clean skipped: $_" }
+          exit 0

@@ -1,0 +1,80 @@
+name: sweep
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+
+defaults:
+  run:
+    shell: powershell
+
+jobs:
+  sweep:
+    name: sweep
+    runs-on: windows
+    timeout-minutes: 15
+    env:
+      GITEA_API: ${{ github.server_url }}/api/v1
+      REPO:      ${{ github.repository }}
+      TOKEN:     ${{ secrets.LAB_BOT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Delete work branches already merged into test
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          git fetch --prune origin
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::git fetch --prune failed - which branches are merged cannot be judged'
+            exit 1
+          }
+          $c = Select-String -Path recipe.ps1 -Encoding UTF8 -Pattern '^\s*\$Code\s*=\s*[''"]([^''"]+)[''"]'
+          if (-not $c) { Write-Host '::error::recipe.ps1 names no $Code - no branch is known to be a work branch'; exit 1 }
+          $work = '^origin/' + [regex]::Escape($c.Matches[0].Groups[1].Value) + '-[1-9][0-9]*/[a-z]+/[a-z0-9]+(-[a-z0-9]+)*$'
+          $merged = git branch -r --merged origin/test |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ -cmatch $work } |
+            ForEach-Object { $_ -replace '^origin/', '' }
+          foreach ($b in $merged) {
+            try {
+              Invoke-RestMethod -Method Delete -Headers $h `
+                -Uri "$env:GITEA_API/repos/$env:REPO/branches/$([uri]::EscapeDataString($b))"
+              Write-Host "deleted $b"
+            } catch { Write-Host "::warning::kept $b : $_" }
+          }
+      - name: Nudge stale pull requests, close the abandoned
+        run: |
+          $h = @{ Authorization = "token $env:TOKEN" }
+          try {
+            $pulls = Invoke-RestMethod -Uri "$env:GITEA_API/repos/$env:REPO/pulls?state=open&limit=50" -Headers $h
+          } catch {
+            Write-Host "::error::could not list the open pull requests: $_"
+            exit 1
+          }
+          foreach ($p in $pulls) {
+            try {
+              $last = [datetime]$p.created_at
+              $head = Invoke-RestMethod -Headers $h `
+                -Uri "$env:GITEA_API/repos/$env:REPO/git/commits/$($p.head.sha)?stat=false&verification=false&files=false"
+              if ([datetime]$head.commit.committer.date -gt $last) { $last = [datetime]$head.commit.committer.date }
+              $comments = Invoke-RestMethod -Headers $h -Uri "$env:GITEA_API/repos/$env:REPO/issues/$($p.number)/comments"
+              foreach ($c in $comments) {
+                if ($c.user.login -ne 'lab-bot' -and [datetime]$c.created_at -gt $last) { $last = [datetime]$c.created_at }
+              }
+              $idle = (New-TimeSpan -Start $last -End (Get-Date)).Days
+              if ($idle -ge 60) {
+                Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$($p.number)/comments" `
+                  -Headers $h -ContentType 'application/json' `
+                  -Body (@{ body = 'Closed after 60 days without movement. Reopen it when the work resumes - nothing is lost.' } | ConvertTo-Json)
+                Invoke-RestMethod -Method Patch -Uri "$env:GITEA_API/repos/$env:REPO/pulls/$($p.number)" `
+                  -Headers $h -ContentType 'application/json' `
+                  -Body (@{ state = 'closed' } | ConvertTo-Json)
+                Write-Host "closed #$($p.number) after $idle days"
+              } elseif ($idle -ge 30) {
+                Invoke-RestMethod -Method Post -Uri "$env:GITEA_API/repos/$env:REPO/issues/$($p.number)/comments" `
+                  -Headers $h -ContentType 'application/json' `
+                  -Body (@{ body = '30 days without movement. Still alive? It closes itself at 60.' } | ConvertTo-Json)
+                Write-Host "nudged #$($p.number) after $idle days"
+              }
+            } catch { Write-Host "::warning::pull request #$($p.number) was left as it was: $_" }
+          }
