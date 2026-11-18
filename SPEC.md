@@ -6,6 +6,30 @@ lines it was read from. Nothing here is a plan: what the repository declares but
 does not do is listed separately in 3.8. The hub for the other documents is
 [docs/README.md](docs/README.md).
 
+<!-- jira-sync:start -->
+Jira: KAN-96
+
+## Tasks
+
+This list is one ticket in Jira project KAN, [KAN-96](https://igorsvolohovs.atlassian.net/browse/KAN-96). Each line is a checkbox there: tick it in Jira and the sync ticks it here; add a checkbox there and it is appended here. Done items are the features described in section 3; open items are what the project declares but the code does not do yet.
+
+- [x] Build (Makefile) (section 3.1) <!-- spec-build-makefile -->
+- [x] Example program (src/main.cpp) (section 3.2) <!-- spec-example-program-src-main-cpp -->
+- [x] Editor integration (.vscode) (section 3.3) <!-- spec-editor-integration-vscode -->
+- [x] Repository interface (recipe.ps1) (section 3.4) <!-- spec-repository-interface-recipe-ps1 -->
+- [x] Git hooks (.claude/hooks/git) (section 3.5) <!-- spec-git-hooks-claude-hooks-git -->
+- [x] Claude Code hooks (.claude) (section 3.6) <!-- spec-claude-code-hooks-claude -->
+- [x] CI workflows (.gitea/workflows) (section 3.7) <!-- spec-ci-workflows-gitea-workflows -->
+- [ ] Qt 5 build (declared, not implemented) <!-- spec-qt-5-build -->
+- [ ] Boost uBLAS, Google Benchmark, Google Test, SQLite examples (declared, not implemented) <!-- spec-boost-ublas-google-benchmark-google-test-sqlite-ex -->
+- [ ] `include/`, `lib/`, `module/`, `bin/` folders (declared, not implemented) <!-- spec-include-lib-module-bin-folders -->
+- [ ] Verbs `build`, `install`, `uninstall`, `run`, `publish` (declared, not implemented) <!-- spec-verbs-build-install-uninstall-run-publish -->
+- [ ] Installer, wiki, manual tests, changelog (declared, not implemented) <!-- spec-installer-wiki-manual-tests-changelog -->
+- [ ] Lab requirement exceptions R-02, R-09, R-37, R-41, R-42 (declared, not implemented) <!-- spec-lab-requirement-exceptions-r-02-r-09-r-37-r-41-r-4 -->
+- [ ] Branch protection stage 2 (declared, not implemented) <!-- spec-branch-protection-stage-2 -->
+
+<!-- jira-sync:end -->
+
 ## 1. Purpose and scope
 
 The repository is a C++20 project skeleton for g++ under MSYS2 MinGW with one
